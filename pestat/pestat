@@ -376,6 +376,13 @@ function tomb(s,   v, u) {
 	return v			# M or no suffix -> megabytes
 }
 
+# Number of GPUs in a tres-per-* request string (e.g. gres:gpu:2, gres:gpu); 0 if none.
+function gpucount(s,   n) {
+	if (s == "" || s == "N/A" || index(s, "gpu") == 0) return 0
+	n = s; sub(/[^0-9]*$/, "", n); sub(/.*[^0-9]/, "", n); n = n + 0
+	return (n == 0 ? 1 : n)		# a bare "gres:gpu" means 1
+}
+
 BEGIN {
 	#####################################################################################
 	# Initialization
@@ -617,6 +624,25 @@ BEGIN {
 	}
 	close (JOBLIST)
 
+	# Aggregate the PENDING queue to show GPU demand (only with -G). Count only jobs that
+	# request a GPU, bucketed by reason: jobs blocked on Resources/Priority are genuinely
+	# waiting for a GPU (the FIFO queue); the rest are self-limited and not competing.
+	if (printgres == 1) {
+		PENDLIST = prefix "/squeue -t PENDING -h -O \047tres-per-node: ,tres-per-job: ,tres-per-task: ,tres-per-socket: ,Reason:\047 " selection " " ENVIRON["partition"]
+		while ((PENDLIST | getline) > 0) {
+			pg = gpucount($1); if (pg == 0) pg = gpucount($2); if (pg == 0) pg = gpucount($3); if (pg == 0) pg = gpucount($4)
+			if (pg == 0) continue		# not a GPU job -> not GPU demand
+			prsn = $5
+			if (prsn ~ /^(Resources|Priority|ReqNodeNotAvail|Nodes_required)/) { pwaitj++; pwaitg += pg }
+			else if (prsn ~ /Held/)              pheld++
+			else if (prsn ~ /JobArrayTaskLimit/) parray++
+			else if (prsn ~ /Dependency/)        pdep++
+			else if (prsn ~ /BeginTime/)         pbegin++
+			else                                 pother++
+		}
+		close (PENDLIST)
+	}
+
 	# Format the column header:
 	# The job information may include EndTime etc.
 	if (arrayjobs == 0)
@@ -755,6 +781,12 @@ BEGIN {
 			gresmm[++ngresmm] = sprintf("  %-12s GresUsed %d vs %d reserved by jobs  (%d %s)", \
 				node, usedgpus, jobgpus, gmad, (gmd > 0 ? "leaked/unreserved" : "missing from GresUsed"))
 		}
+		# Tally cluster GPU supply for the queue footer (skip down/drained/reserved nodes)
+		if (availgpus > 0 && state !~ /^(down|drain|drng|resv|maint|boot|error|comp|fail|unk|pow|plnd|na)/) {
+			qtotgpu += availgpus
+			qfreegpu += (availgpus - usedgpus)
+			if (usedgpus > jobgpus) qleaked += (usedgpus - jobgpus)
+		}
 		# Pad to the widest node bar (maxgpus + 2 brackets) plus a separator space
 		pad = (maxgpus + 2) - barvis + 1
 		for (gbi=0; gbi<pad; gbi++) gpubar = gpubar " "
@@ -892,5 +924,17 @@ END {
 			printf("GRES mismatch (* in count; Slurm GresUsed vs summed job reservations):\n")
 			for (mi = 1; mi <= ngresmm; mi++) printf("%s\n", gresmm[mi])
 		}
+		# Queue (GPU demand) and supply summary
+		qnot = ""
+		if (pheld)  qnot = qnot sprintf("  %d held", pheld)
+		if (parray) qnot = qnot sprintf("  %d array-throttled", parray)
+		if (pdep)   qnot = qnot sprintf("  %d dependency", pdep)
+		if (pbegin) qnot = qnot sprintf("  %d begin-delayed", pbegin)
+		if (pother) qnot = qnot sprintf("  %d other", pother)
+		printf("Queue:    waiting for a GPU: %s%d jobs / %d GPUs%s%s\n", \
+			(pwaitg > 0 ? YELLOW : NORMAL), pwaitj+0, pwaitg+0, NORMAL, \
+			(qnot != "" ? "    not competing:" qnot : ""))
+		supnote = (qleaked > 0 ? sprintf("  (>=%d more idle but marked used -- GresUsed leak, see above)", qleaked) : "")
+		printf("Supply:   %d / %d GPUs free per Slurm%s\n", qfreegpu+0, qtotgpu+0, supnote)
 	}
 }'
