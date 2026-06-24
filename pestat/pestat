@@ -395,7 +395,7 @@ BEGIN {
 	# Column size(width)=30 hopefully suffices to separate columns
 	# The -O output fields must be space-separated, so use :(space) "sufix" and enclose -O fields in '' (octal 047)
 	# Older Slurm versions before 20.02 do not support the "sufix" after -O and may thus not work correctly
-	JOBLIST = prefix "/squeue -t RUNNING -h -O \047State: ,JobID: ,JobArrayID: ,UserName: ,GroupName: ,Account: ,StartTime: ,EndTime: ,TimeUsed: ,Partition: ,NumNodes: ,tres-alloc: ,NodeList: ,Name:\047 " selection
+	JOBLIST = prefix "/squeue -t RUNNING -h -O \047State: ,JobID: ,JobArrayID: ,UserName: ,GroupName: ,Account: ,StartTime: ,EndTime: ,TimeUsed: ,Partition: ,NumNodes: ,tres-alloc: ,Gres: ,tres-per-job: ,tres-per-task: ,tres-per-socket: ,NodeList: ,Name:\047 " selection
 	while ((JOBLIST | getline) > 0) {
 		JobState=$1
 		JobID=$2
@@ -409,8 +409,12 @@ BEGIN {
 		Partition=$10
 		NumNodes=$11
 		TresAlloc=$12
-		NodeList=$13
-		JobName=$14
+		Gres=$13
+		TresPerJob=$14
+		TresPerTask=$15
+		TresPerSocket=$16
+		NodeList=$17
+		JobName=$18
 		if (JobName=="") JobName="(None)"
 		# Select job information to be printed for this job
 		if (JobArrayID == JobID) 
@@ -443,6 +447,20 @@ BEGIN {
 					# Omit the "gres/" string and start at char 6:
 					GRES = substr(treslist[i],6)
 				}
+			}
+			# Fallback when gres/gpu is not an accounting TRES, so tres-alloc omits it
+			# (e.g. AccountingStorageTRES without gres/gpu, or accounting disabled):
+			# derive the GPU count from the GRES *request* fields instead.
+			# "--gres=gpu:N" populates Gres (tres-per-node), while "--gpus=N" populates
+			# tres-per-job, and per-task/socket requests the remaining fields. These are
+			# checked in priority order and shown in RED as they are the requested
+			# (not accounting-confirmed) GRES. The node-level GRES column remains
+			# authoritative for what is actually allocated.
+			if (GRES == RED "(null)" NORMAL) {
+				if      (Gres          != "" && Gres          != "N/A" && index(Gres,          "gpu") > 0) GRES = RED substr(Gres,          6) NORMAL
+				else if (TresPerJob    != "" && TresPerJob    != "N/A" && index(TresPerJob,    "gpu") > 0) GRES = RED substr(TresPerJob,    6) NORMAL
+				else if (TresPerTask   != "" && TresPerTask   != "N/A" && index(TresPerTask,   "gpu") > 0) GRES = RED substr(TresPerTask,   6) NORMAL
+				else if (TresPerSocket != "" && TresPerSocket != "N/A" && index(TresPerSocket, "gpu") > 0) GRES = RED substr(TresPerSocket, 6) NORMAL
 			}
 			JobInfo = JobInfo GRES " "
 			# Job GRES width for formatting the width below:
