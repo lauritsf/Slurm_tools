@@ -163,6 +163,13 @@ maxgpus=$($prefix/sinfo -h -N $all_partitions $partition $hostlist $statelist -O
 	| awk '{ if (match($0,/gpu:([^:]+:)?[0-9]+/)) { s=substr($0,RSTART,RLENGTH); sub(/.*:/,"",s); if (s+0>m) m=s+0 } } END{ print m+0 }')
 export maxgpus
 
+# Per-node "cores:mem(MB):gpus" map, used to color each job GPU request by how its
+# CPU-per-GPU / mem-per-GPU compares to the node fair share (total_cpu/total_gpu etc.).
+noderatiomap=$($prefix/sinfo -h -N $all_partitions $partition $hostlist $statelist -O "NodeList:50,CPUs:20,Memory:20,Gres:60" 2>/dev/null \
+	| awk '{ g=0; if (match($4,/gpu:([^:]+:)?[0-9]+/)) { s=substr($4,RSTART,RLENGTH); sub(/.*:/,"",s); g=s+0 }
+		 if (g>0) printf "%s=%s:%s:%d|", $1, $2, $3, g }')
+export noderatiomap
+
 #####################################################################################
 #
 # Parse command options
@@ -358,6 +365,17 @@ fi
 # $prefix/sinfo -h -N $partition $hostlist $statelist -O "NodeList: ,Partition: ,CPUsState: ,CPUsLoad: ,Memory: ,FreeMem: ,StateCompact: ,Threads: ,Gres: " | $my_awk '
 # Column size(width)=30 hopefully suffices to separate columns
 $prefix/sinfo -h -N $all_partitions $partition $hostlist $statelist -O "NodeList:30,Partition:30,CPUsState:30,CPUsLoad:30,Memory:30,FreeMem:30,StateCompact:30,Threads:30,Gres:30,GresUsed:30,AllocMem:30" | $my_awk '
+# Convert a Slurm memory string (e.g. 32G, 32768M, 0.5T) to megabytes.
+function tomb(s,   v, u) {
+	if (s == "" || s == "N/A") return 0
+	v = s + 0			# leading number
+	u = substr(s, length(s), 1)	# unit suffix
+	if (u == "T" || u == "t") return v * 1024 * 1024
+	if (u == "G" || u == "g") return v * 1024
+	if (u == "K" || u == "k") return v / 1024
+	return v			# M or no suffix -> megabytes
+}
+
 BEGIN {
 	#####################################################################################
 	# Initialization
@@ -384,6 +402,23 @@ BEGIN {
 	maxgpus=ENVIRON["maxgpus"]+0	# Largest GPU count on any node (bar-column width)
 	gpubar_minmem=ENVIRON["gpubar_minmem"]+0	# Min MB for a free GPU to count as grabbable
 	if (gpubar_minmem <= 0) gpubar_minmem = 1024
+	# Per-job GPU fair-share coloring thresholds (multiples of the node fair ratio)
+	gpufair_ok=ENVIRON["gpufair_ok"]+0	# at/under this -> green
+	if (gpufair_ok <= 0) gpufair_ok = 1.05
+	gpufair_warn=ENVIRON["gpufair_warn"]+0	# above this -> red (between ok and warn -> yellow)
+	if (gpufair_warn <= 0) gpufair_warn = 1.5
+	# Parse per-node "cores:mem:gpus" map for per-job fair-share coloring
+	split(ENVIRON["noderatiomap"], nrarr, "|")
+	for (nri in nrarr) {
+		neq = index(nrarr[nri], "=")
+		if (neq > 0) {
+			nrnode = substr(nrarr[nri], 1, neq-1)
+			if (split(substr(nrarr[nri], neq+1), nrv, ":") == 3 && nrv[3] > 0) {
+				noderatiocpu[nrnode] = nrv[1] / nrv[3]
+				noderatiomem[nrnode] = nrv[2] / nrv[3]
+			}
+		}
+	}
 	# Parse the optional per-node GPU descriptor map: node=descriptor|node=descriptor|...
 	# Displayed as a per-node column (next to GRES/used), not per job.
 	gpumodelwidth = 15	# minimum width (fits the "arch/model/vram" header)
@@ -471,32 +506,46 @@ BEGIN {
 		}
 		if (printgres == 1) {
 			gpuraw = ""	# raw "gpu[:type][:count]" string (no color)
-			requested = 0	# set when derived from a request field (shown in RED)
+			jobcpu = 0; jobmem = 0
 			# Authoritative source: the accounting tres-alloc list (gres/gpu=...).
-			# Additional tres-alloc values (e.g. cpu=) could be extracted here too.
+			# Also collect this job CPU and memory for the fair-share coloring below.
 			split (TresAlloc, treslist, ",")
 			for (i in treslist) {
-				# Omit the "gres/" string and start at char 6:
 				if (index(treslist[i], "gres/gpu=") > 0 || index(treslist[i], "gres/gpu:") > 0)
-					gpuraw = substr(treslist[i],6)
+					gpuraw = substr(treslist[i],6)			# omit the "gres/" prefix
+				else if (index(treslist[i], "cpu=") == 1) jobcpu = substr(treslist[i],5) + 0
+				else if (index(treslist[i], "mem=") == 1) jobmem = tomb(substr(treslist[i],5))
 			}
 			# Fallback when gres/gpu is not an accounting TRES, so tres-alloc omits it
 			# (e.g. AccountingStorageTRES without gres/gpu, or accounting disabled):
-			# derive the GPU from the GRES *request* fields instead. "--gres=gpu:N"
-			# populates Gres (tres-per-node), "--gpus=N" populates tres-per-job, and
-			# per-task/socket requests the remaining fields. Checked in priority order;
-			# shown in RED below as they are the requested (not accounting-confirmed)
-			# GRES. The node-level GRES column remains authoritative for actual use.
+			# derive the GPU from the GRES request fields. "--gres=gpu:N" populates Gres
+			# (tres-per-node), "--gpus=N" populates tres-per-job, and per-task/socket the
+			# remaining fields. Checked in priority order.
 			if (gpuraw == "") {
-				requested = 1
 				if      (Gres          != "" && Gres          != "N/A" && index(Gres,          "gpu") > 0) gpuraw = substr(Gres,          6)
 				else if (TresPerJob    != "" && TresPerJob    != "N/A" && index(TresPerJob,    "gpu") > 0) gpuraw = substr(TresPerJob,    6)
 				else if (TresPerTask   != "" && TresPerTask   != "N/A" && index(TresPerTask,   "gpu") > 0) gpuraw = substr(TresPerTask,   6)
 				else if (TresPerSocket != "" && TresPerSocket != "N/A" && index(TresPerSocket, "gpu") > 0) gpuraw = substr(TresPerSocket, 6)
 			}
-			if (gpuraw == "") GRES = RED "(null)" NORMAL	# Default is null GRES in RED color
-			else if (requested) GRES = RED gpuraw NORMAL	# Requested GRES (not accounting-confirmed)
-			else GRES = gpuraw
+			if (gpuraw == "")
+				GRES = RED "(null)" NORMAL	# No GPU for this job
+			else {
+				# Color the GPU request by how its CPU-per-GPU / mem-per-GPU compares to
+				# the node fair share: green <= gpufair_ok, yellow <= gpufair_warn, red above.
+				jobgpu = gpuraw
+				sub(/[^0-9]*$/, "", jobgpu); sub(/.*[^0-9]/, "", jobgpu)	# trailing count, if any
+				jobgpu = jobgpu + 0
+				if (jobgpu == 0) jobgpu = 1	# a bare "gpu"/"gpu:type" means 1 GPU
+				gcol = GREEN
+				if (NodeList in noderatiocpu) {
+					cfrac = (noderatiocpu[NodeList] > 0 ? (jobcpu/jobgpu)/noderatiocpu[NodeList] : 0)
+					mfrac = (noderatiomem[NodeList] > 0 ? (jobmem/jobgpu)/noderatiomem[NodeList] : 0)
+					worst = (cfrac > mfrac ? cfrac : mfrac)
+					if (worst > gpufair_warn) gcol = RED
+					else if (worst > gpufair_ok) gcol = YELLOW
+				}
+				GRES = gcol gpuraw NORMAL
+			}
 			JobInfo = JobInfo GRES " "
 			# Job GRES width for formatting the width below:
 			if (length(GRES) > jobgreswidth) jobgreswidth = length(GRES)
