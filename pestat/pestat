@@ -157,6 +157,12 @@ then
 fi
 export gpumodelmap
 
+# Largest GPU count on any selected node, used to align the GPU availability bar
+# column (the per-GPU [....] schema shown by -G).
+maxgpus=$($prefix/sinfo -h -N $all_partitions $partition $hostlist $statelist -O "Gres:60" 2>/dev/null \
+	| awk '{ if (match($0,/gpu:([^:]+:)?[0-9]+/)) { s=substr($0,RSTART,RLENGTH); sub(/.*:/,"",s); if (s+0>m) m=s+0 } } END{ print m+0 }')
+export maxgpus
+
 #####################################################################################
 #
 # Parse command options
@@ -351,7 +357,7 @@ fi
 # Was: $prefix/sinfo -h -N $partition $hostlist $statelist -o "%N %P %C %O %m %e %t %Z %G" | $my_awk '
 # $prefix/sinfo -h -N $partition $hostlist $statelist -O "NodeList: ,Partition: ,CPUsState: ,CPUsLoad: ,Memory: ,FreeMem: ,StateCompact: ,Threads: ,Gres: " | $my_awk '
 # Column size(width)=30 hopefully suffices to separate columns
-$prefix/sinfo -h -N $all_partitions $partition $hostlist $statelist -O "NodeList:30,Partition:30,CPUsState:30,CPUsLoad:30,Memory:30,FreeMem:30,StateCompact:30,Threads:30,Gres:30,GresUsed:30" | $my_awk '
+$prefix/sinfo -h -N $all_partitions $partition $hostlist $statelist -O "NodeList:30,Partition:30,CPUsState:30,CPUsLoad:30,Memory:30,FreeMem:30,StateCompact:30,Threads:30,Gres:30,GresUsed:30,AllocMem:30" | $my_awk '
 BEGIN {
 	#####################################################################################
 	# Initialization
@@ -375,6 +381,9 @@ BEGIN {
 	statedown=ENVIRON["statedown"]
 	printgres=ENVIRON["printgres"]
 	jobgreswidth=0
+	maxgpus=ENVIRON["maxgpus"]+0	# Largest GPU count on any node (bar-column width)
+	gpubar_minmem=ENVIRON["gpubar_minmem"]+0	# Min MB for a free GPU to count as grabbable
+	if (gpubar_minmem <= 0) gpubar_minmem = 1024
 	# Parse the optional per-node GPU descriptor map: node=descriptor|node=descriptor|...
 	# Displayed as a per-node column (next to GRES/used), not per job.
 	gpumodelwidth = 15	# minimum width (fits the "arch/model/vram" header)
@@ -402,6 +411,8 @@ BEGIN {
 		# See http://en.wikipedia.org/wiki/ANSI_escape_code#Colors
 		RED="\033[1;31m"
 		GREEN="\033[1;32m"
+		YELLOW="\033[1;33m"
+		BLUE="\033[1;34m"
 		MAGENTA="\033[1;35m"
 		NORMAL="\033[0m"
 	}
@@ -568,8 +579,9 @@ BEGIN {
 		# Optional per-node GPU descriptor column, shown only when a PESTAT_GPU_MODEL map is set
 		gmhdr1 = (havemodelmap ? sprintf("%-*s ", gpumodelwidth, "GPU") : "")
 		gmhdr2 = (havemodelmap ? sprintf("%-*s ", gpumodelwidth, "arch/model/vram") : "")
-		printf("%-*s %15s %8s %7s %8s %8s %8s  %5s %s%s\n", hostnamelength, "Hostname", "Partition", "Node", "Num_CPU", "CPUload", "Memsize", "Freemem", "GRES/", gmhdr1, "Joblist")
-		printf("%-*s %15s %8s %7s %8s %8s %8s  %5s %s%s\n", hostnamelength, "", "", "State", "Use/Tot", "(15min)", "(MB)", "(MB)", "used ", gmhdr2, JobInfo)
+		barhdr = sprintf("%*s", maxgpus + 3, "")	# blank header over the GPU availability bar
+		printf("%-*s %15s %8s %7s %8s %8s %8s  %5s %s%s%s\n", hostnamelength, "Hostname", "Partition", "Node", "Num_CPU", "CPUload", "Memsize", "Freemem", "GRES/", barhdr, gmhdr1, "Joblist")
+		printf("%-*s %15s %8s %7s %8s %8s %8s  %5s %s%s%s\n", hostnamelength, "", "", "State", "Use/Tot", "(15min)", "(MB)", "(MB)", "used ", barhdr, gmhdr2, JobInfo)
 	} else {
 		printf("%-*s %15s %8s %7s %8s %8s %8s  %s\n", hostnamelength, "Hostname", "Partition", "Node", "Num_CPU", "CPUload", "Memsize", "Freemem", "Joblist")
 		printf("%-*s %15s %8s %7s %8s %8s %8s  %s\n", hostnamelength, "", "", "State", "Use/Tot", "(15min)", "(MB)", "(MB)", JobInfo)
@@ -614,6 +626,7 @@ BEGIN {
 	# Generic resources (GRES) associated and used with the node
 	nodegres=$9
 	gresused=$10
+	allocmem=$11			# Slurm-allocated memory (MB), for schedulable-memory headroom
 	# Decode the number of GPUs available and used
 	if (gresused != "(null)") {
 		split(nodegres, gu, ":")
@@ -624,8 +637,54 @@ BEGIN {
 		usedgpus=ng[1]
 		delete gu
 		delete ng
-	} else
+	} else {
+		availgpus=0
 		usedgpus=0
+	}
+
+	# Build the colored per-GPU availability bar (the [....] schema), one mark per GPU:
+	#   blue   = in use
+	#   green  = free and usable at the node fair CPU/mem-per-GPU ratio
+	#   yellow = free but only below the fair ratio (CPU/mem cramped)
+	#   red    = free but blocked (CPU or memory exhausted -> GPU cannot be scheduled)
+	# Padded to the widest node so the following columns stay aligned.
+	gpubar = ""
+	if (printgres == 1) {
+		barvis = 0
+		if (availgpus > 0) {
+			free_gpus = availgpus - usedgpus
+			if (free_gpus < 0) free_gpus = 0
+			cpu_per_gpu = total_cores / availgpus
+			mem_per_gpu = memory / availgpus
+			free_cores = total_cores - allocated_cores
+			if (free_cores < 0) free_cores = 0
+			free_mem = memory - allocmem
+			if (free_mem < 0) free_mem = 0
+			# GPUs that can get at least the fair share of CPU and memory (green)
+			grn = free_gpus
+			if (cpu_per_gpu > 0 && int(free_cores/cpu_per_gpu) < grn) grn = int(free_cores/cpu_per_gpu)
+			if (mem_per_gpu > 0 && int(free_mem/mem_per_gpu) < grn) grn = int(free_mem/mem_per_gpu)
+			if (grn < 0) grn = 0
+			# GPUs that can take at least a minimal job: >=1 core and >=gpubar_minmem MB (grabbable)
+			grab = free_gpus
+			if (int(free_cores) < grab) grab = int(free_cores)
+			if (int(free_mem/gpubar_minmem) < grab) grab = int(free_mem/gpubar_minmem)
+			if (grab < grn) grab = grn
+			if (grab > free_gpus) grab = free_gpus
+			ylw = grab - grn		# free but below fair share
+			rd = free_gpus - grab		# free but blocked (no CPU/mem to pair)
+			gpubar = "["
+			for (gbi=0; gbi<usedgpus; gbi++) gpubar = gpubar BLUE   "■" NORMAL
+			for (gbi=0; gbi<grn; gbi++)      gpubar = gpubar GREEN  "■" NORMAL
+			for (gbi=0; gbi<ylw; gbi++)      gpubar = gpubar YELLOW "■" NORMAL
+			for (gbi=0; gbi<rd; gbi++)       gpubar = gpubar RED    "■" NORMAL
+			gpubar = gpubar "]"
+			barvis = availgpus + 2
+		}
+		# Pad to the widest node bar (maxgpus + 2 brackets) plus a separator space
+		pad = (maxgpus + 2) - barvis + 1
+		for (gbi=0; gbi<pad; gbi++) gpubar = gpubar " "
+	}
 
 	# Select only subset of nodes with certain values/states
 	listnode = printallnodes
@@ -731,7 +790,7 @@ BEGIN {
 		printf("%s%8d %s%8d%1s%s ", memcolor, memory, freememcolor, freemem, memflag, NORMAL)
 		if (printgres == 1) {
 			gmcol = (havemodelmap ? sprintf("%-*s ", gpumodelwidth, (node in modelmap ? modelmap[node] : "-")) : "")
-			printf("%2d/%-2d %s", availgpus, usedgpus, gmcol)
+			printf("%2d/%-2d %s%s", availgpus, usedgpus, gpubar, gmcol)
 		}
 		printf("%s%s%1s%s", jobcolor, jobs[node], jobflag, NORMAL)
 		printf("\n")
