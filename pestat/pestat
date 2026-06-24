@@ -406,7 +406,7 @@ BEGIN {
 	gpufair_ok=ENVIRON["gpufair_ok"]+0	# at/under this -> green
 	if (gpufair_ok <= 0) gpufair_ok = 1.05
 	gpufair_warn=ENVIRON["gpufair_warn"]+0	# above this -> red (between ok and warn -> yellow)
-	if (gpufair_warn <= 0) gpufair_warn = 1.5
+	if (gpufair_warn <= 0) gpufair_warn = 1.25
 	# Parse per-node "cores:mem:gpus" map for per-job fair-share coloring
 	split(ENVIRON["noderatiomap"], nrarr, "|")
 	for (nri in nrarr) {
@@ -541,8 +541,17 @@ BEGIN {
 					cfrac = (noderatiocpu[NodeList] > 0 ? (jobcpu/jobgpu)/noderatiocpu[NodeList] : 0)
 					mfrac = (noderatiomem[NodeList] > 0 ? (jobmem/jobgpu)/noderatiomem[NodeList] : 0)
 					worst = (cfrac > mfrac ? cfrac : mfrac)
-					if (worst > gpufair_warn) gcol = RED
-					else if (worst > gpufair_ok) gcol = YELLOW
+					sevlvl = 0
+					if (worst > gpufair_warn) { gcol = RED; sevlvl = 2 }
+					else if (worst > gpufair_ok) { gcol = YELLOW; sevlvl = 1 }
+					if (sevlvl > 0) {
+						# Record the specific over-fair case for the legend at the bottom
+						reason = ""
+						if (cfrac > gpufair_ok) reason = reason sprintf("CPU %.2fx ", cfrac)
+						if (mfrac > gpufair_ok) reason = reason sprintf("mem %.2fx ", mfrac)
+						sev = (sevlvl == 2 ? RED "over" NORMAL : YELLOW "borderline" NORMAL)
+						oversub[++noversub] = sprintf("  %-12s %-9s %-12s %-22s %s", NodeList, User, JobArrayID, reason, sev)
+					}
 				}
 				GRES = gcol gpuraw NORMAL
 			}
@@ -858,6 +867,10 @@ END {
 		printf("GPU bar:  %s■%s in use   %s■%s free, fair share   %s■%s free, below fair   %s■%s free but blocked / node down\n", BLUE, NORMAL, GREEN, NORMAL, YELLOW, NORMAL, RED, NORMAL)
 		printf("Job GPU:  colored by its CPU- and memory-per-GPU vs the node fair share (total_cpu/total_gpu and total_mem/total_gpu):\n")
 		printf("          %sgreen%s <= %gx fair      %syellow%s <= %gx (borderline)      %sred%s > %gx (oversubscribed)\n", GREEN, NORMAL, gpufair_ok, YELLOW, NORMAL, gpufair_warn, RED, NORMAL, gpufair_warn)
-		printf("Oversubscribed = a node CPU or memory is so heavily allocated that a remaining free GPU cannot get a fair (or even minimal) share.\n")
+		if (noversub > 0) {
+			printf("Oversubscribed jobs (the offending CPU/memory-per-GPU vs node fair share):\n")
+			for (oi = 1; oi <= noversub; oi++) printf("%s\n", oversub[oi])
+		} else
+			printf("Oversubscribed jobs: none\n")
 	}
 }'
