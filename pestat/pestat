@@ -536,6 +536,7 @@ BEGIN {
 				sub(/[^0-9]*$/, "", jobgpu); sub(/.*[^0-9]/, "", jobgpu)	# trailing count, if any
 				jobgpu = jobgpu + 0
 				if (jobgpu == 0) jobgpu = 1	# a bare "gpu"/"gpu:type" means 1 GPU
+				nodejobgpu[NodeList] += jobgpu	# sum reservations per node (vs GresUsed)
 				gcol = GREEN
 				if (NodeList in noderatiocpu) {
 					cfrac = (noderatiocpu[NodeList] > 0 ? (jobcpu/jobgpu)/noderatiocpu[NodeList] : 0)
@@ -638,8 +639,8 @@ BEGIN {
 		gmhdr1 = (havemodelmap ? sprintf("%-*s ", gpumodelwidth, "GPU") : "")
 		gmhdr2 = (havemodelmap ? sprintf("%-*s ", gpumodelwidth, "arch/model/vram") : "")
 		barhdr = sprintf("%*s", maxgpus + 3, "")	# blank header over the GPU availability bar
-		printf("%-*s %15s %8s %7s %8s %8s %8s  %5s %s%s%s\n", hostnamelength, "Hostname", "Partition", "Node", "Num_CPU", "CPUload", "Memsize", "Freemem", "GRES/", barhdr, gmhdr1, "Joblist")
-		printf("%-*s %15s %8s %7s %8s %8s %8s  %5s %s%s%s\n", hostnamelength, "", "", "State", "Use/Tot", "(15min)", "(MB)", "(MB)", "used ", barhdr, gmhdr2, JobInfo)
+		printf("%-*s %15s %8s %7s %8s %8s %8s  %-6s %s%s%s\n", hostnamelength, "Hostname", "Partition", "Node", "Num_CPU", "CPUload", "Memsize", "Freemem", "GRES/", barhdr, gmhdr1, "Joblist")
+		printf("%-*s %15s %8s %7s %8s %8s %8s  %-6s %s%s%s\n", hostnamelength, "", "", "State", "Use/Tot", "(15min)", "(MB)", "(MB)", "used", barhdr, gmhdr2, JobInfo)
 	} else {
 		printf("%-*s %15s %8s %7s %8s %8s %8s  %s\n", hostnamelength, "Hostname", "Partition", "Node", "Num_CPU", "CPUload", "Memsize", "Freemem", "Joblist")
 		printf("%-*s %15s %8s %7s %8s %8s %8s  %s\n", hostnamelength, "", "", "State", "Use/Tot", "(15min)", "(MB)", "(MB)", JobInfo)
@@ -744,6 +745,15 @@ BEGIN {
 			for (gbi=0; gbi<rd; gbi++)       gpubar = gpubar RED    "■" NORMAL
 			gpubar = gpubar "]"
 			barvis = availgpus + 2
+		}
+		# Flag GRES accounting mismatch: node GresUsed vs summed job GPU reservations.
+		# A leak (GresUsed > reserved) strands GPUs; the reverse means usage GresUsed misses.
+		jobgpus = (node in nodejobgpu ? nodejobgpu[node] : 0)
+		gmismatch = (availgpus > 0 && jobgpus != usedgpus)
+		if (gmismatch) {
+			gmd = usedgpus - jobgpus; gmad = (gmd < 0 ? -gmd : gmd)
+			gresmm[++ngresmm] = sprintf("  %-12s GresUsed %d vs %d reserved by jobs  (%d %s)", \
+				node, usedgpus, jobgpus, gmad, (gmd > 0 ? "leaked/unreserved" : "missing from GresUsed"))
 		}
 		# Pad to the widest node bar (maxgpus + 2 brackets) plus a separator space
 		pad = (maxgpus + 2) - barvis + 1
@@ -854,7 +864,13 @@ BEGIN {
 		printf("%s%8d %s%8d%1s%s ", memcolor, memory, freememcolor, freemem, memflag, NORMAL)
 		if (printgres == 1) {
 			gmcol = (havemodelmap ? sprintf("%-*s ", gpumodelwidth, (node in modelmap ? modelmap[node] : "-")) : "")
-			printf("%2d/%-2d %s%s", availgpus, usedgpus, gpubar, gmcol)
+			# Count field "used/total" with a * marker when GresUsed disagrees with jobs,
+			# left-justified to a fixed visible width so the bar column stays aligned.
+			cnt = sprintf("%d/%d", availgpus, usedgpus)
+			cntmark = (gmismatch ? MAGENTA "*" NORMAL : "")
+			cntpad = 6 - length(cnt) - (gmismatch ? 1 : 0); if (cntpad < 0) cntpad = 0
+			padsp = ""; for (cpk = 0; cpk < cntpad; cpk++) padsp = padsp " "
+			printf("%s%s%s %s%s", cnt, cntmark, padsp, gpubar, gmcol)
 		}
 		printf("%s%s%1s%s", jobcolor, jobs[node], jobflag, NORMAL)
 		printf("\n")
@@ -872,5 +888,9 @@ END {
 			for (oi = 1; oi <= noversub; oi++) printf("%s\n", oversub[oi])
 		} else
 			printf("Oversubscribed jobs: none\n")
+		if (ngresmm > 0) {
+			printf("GRES mismatch (* in count; Slurm GresUsed vs summed job reservations):\n")
+			for (mi = 1; mi <= ngresmm; mi++) printf("%s\n", gresmm[mi])
+		}
 	}
 }'
