@@ -695,7 +695,7 @@ BEGIN {
 	#   blue   = in use
 	#   green  = free and usable at the node fair CPU/mem-per-GPU ratio
 	#   yellow = free but only below the fair ratio (CPU/mem cramped)
-	#   red    = free but blocked (CPU or memory exhausted -> GPU cannot be scheduled)
+	#   red    = free but blocked (CPU/memory exhausted, or node down/drained/reserved)
 	# Padded to the widest node so the following columns stay aligned.
 	gpubar = ""
 	if (printgres == 1) {
@@ -703,25 +703,31 @@ BEGIN {
 		if (availgpus > 0) {
 			free_gpus = availgpus - usedgpus
 			if (free_gpus < 0) free_gpus = 0
-			cpu_per_gpu = total_cores / availgpus
-			mem_per_gpu = memory / availgpus
-			free_cores = total_cores - allocated_cores
-			if (free_cores < 0) free_cores = 0
-			free_mem = memory - allocmem
-			if (free_mem < 0) free_mem = 0
-			# GPUs that can get at least the fair share of CPU and memory (green)
-			grn = free_gpus
-			if (cpu_per_gpu > 0 && int(free_cores/cpu_per_gpu) < grn) grn = int(free_cores/cpu_per_gpu)
-			if (mem_per_gpu > 0 && int(free_mem/mem_per_gpu) < grn) grn = int(free_mem/mem_per_gpu)
-			if (grn < 0) grn = 0
-			# GPUs that can take at least a minimal job: >=1 core and >=gpubar_minmem MB (grabbable)
-			grab = free_gpus
-			if (int(free_cores) < grab) grab = int(free_cores)
-			if (int(free_mem/gpubar_minmem) < grab) grab = int(free_mem/gpubar_minmem)
-			if (grab < grn) grab = grn
-			if (grab > free_gpus) grab = free_gpus
-			ylw = grab - grn		# free but below fair share
-			rd = free_gpus - grab		# free but blocked (no CPU/mem to pair)
+			grn = 0; ylw = 0; rd = 0
+			if (state ~ /^(down|drain|drng|resv|maint|boot|error|comp|fail|unk|pow|plnd|na)/) {
+				# Node is not accepting jobs: its free GPUs are unavailable (red)
+				rd = free_gpus
+			} else {
+				cpu_per_gpu = total_cores / availgpus
+				mem_per_gpu = memory / availgpus
+				free_cores = total_cores - allocated_cores
+				if (free_cores < 0) free_cores = 0
+				free_mem = memory - allocmem
+				if (free_mem < 0) free_mem = 0
+				# GPUs that can get at least the fair share of CPU and memory (green)
+				grn = free_gpus
+				if (cpu_per_gpu > 0 && int(free_cores/cpu_per_gpu) < grn) grn = int(free_cores/cpu_per_gpu)
+				if (mem_per_gpu > 0 && int(free_mem/mem_per_gpu) < grn) grn = int(free_mem/mem_per_gpu)
+				if (grn < 0) grn = 0
+				# GPUs that can take at least a minimal job: >=1 core and >=gpubar_minmem MB (grabbable)
+				grab = free_gpus
+				if (int(free_cores) < grab) grab = int(free_cores)
+				if (int(free_mem/gpubar_minmem) < grab) grab = int(free_mem/gpubar_minmem)
+				if (grab < grn) grab = grn
+				if (grab > free_gpus) grab = free_gpus
+				ylw = grab - grn	# free but below fair share
+				rd = free_gpus - grab	# free but blocked (no CPU/mem to pair)
+			}
 			gpubar = "["
 			for (gbi=0; gbi<usedgpus; gbi++) gpubar = gpubar BLUE   "■" NORMAL
 			for (gbi=0; gbi<grn; gbi++)      gpubar = gpubar GREEN  "■" NORMAL
@@ -843,5 +849,15 @@ BEGIN {
 		}
 		printf("%s%s%1s%s", jobcolor, jobs[node], jobflag, NORMAL)
 		printf("\n")
+	}
+}
+END {
+	# Legend explaining the -G GPU bar colors and what counts as oversubscription
+	if (printgres == 1) {
+		printf("\n")
+		printf("GPU bar:  %s■%s in use   %s■%s free, fair share   %s■%s free, below fair   %s■%s free but blocked / node down\n", BLUE, NORMAL, GREEN, NORMAL, YELLOW, NORMAL, RED, NORMAL)
+		printf("Job GPU:  colored by its CPU- and memory-per-GPU vs the node fair share (total_cpu/total_gpu and total_mem/total_gpu):\n")
+		printf("          %sgreen%s <= %gx fair      %syellow%s <= %gx (borderline)      %sred%s > %gx (oversubscribed)\n", GREEN, NORMAL, gpufair_ok, YELLOW, NORMAL, gpufair_warn, RED, NORMAL, gpufair_warn)
+		printf("Oversubscribed = a node CPU or memory is so heavily allocated that a remaining free GPU cannot get a fair (or even minimal) share.\n")
 	}
 }'
