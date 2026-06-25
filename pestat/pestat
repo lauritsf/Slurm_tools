@@ -409,17 +409,14 @@ BEGIN {
 	maxgpus=ENVIRON["maxgpus"]+0	# Largest GPU count on any node (bar-column width)
 	gpubar_minmem=ENVIRON["gpubar_minmem"]+0	# Min MB for a free GPU to count as grabbable
 	if (gpubar_minmem <= 0) gpubar_minmem = 1024
-	# Per-job GPU fair-share coloring. Green = at/under the true fair share (1.0x).
-	# CPU is exact, so it gets a small yellow band up to gpufair_warn x fair before red.
-	# Memory is rounded: RealMemory is below the nominal installed RAM (OS reserve), so
-	# users computing nominal/GPU (e.g. 256GB/8 = 32GB) land just over the true fair share
-	# (31.2GB). That nominal-rounded request is treated as borderline (yellow), not red;
-	# only memory above the nominal fair share is red. gpubar_nominal is the rounding
-	# granularity (MB) for inferring nominal RAM from RealMemory (default 16 GiB).
-	gpufair_ok=ENVIRON["gpufair_ok"]+0	# CPU/mem at/under this x fair -> green
+	# Per-job GPU fair-share coloring. Green = at/under the true fair share (1.0x) on BOTH
+	# CPU and memory. Yellow (borderline) requires CPU fully within fair share AND memory
+	# over true fair only up to the nominal/rounded share: RealMemory is below the nominal
+	# installed RAM (OS reserve), so users computing nominal/GPU (e.g. 256GB/8 = 32GB) land
+	# just over the true fair share (31.2GB) -- that is tolerated. Everything else is red:
+	# any CPU over fair, or memory above the nominal fair share.
+	gpufair_ok=ENVIRON["gpufair_ok"]+0	# CPU/mem at/under this x true fair -> green
 	if (gpufair_ok <= 0) gpufair_ok = 1.0
-	gpufair_warn=ENVIRON["gpufair_warn"]+0	# CPU above this x fair -> red (else yellow)
-	if (gpufair_warn <= 0) gpufair_warn = 1.25
 	gpunom_gran=ENVIRON["gpunom_gran"]+0	# round RealMemory up to this (MB) for nominal RAM
 	if (gpunom_gran <= 0) gpunom_gran = 16384
 	# Parse per-node "cores:mem:gpus" map for per-job fair-share coloring
@@ -548,8 +545,8 @@ BEGIN {
 			if (gpuraw == "")
 				GRES = RED "(null)" NORMAL	# No GPU for this job
 			else {
-				# Color the GPU request by how its CPU-per-GPU / mem-per-GPU compares to
-				# the node fair share: green <= gpufair_ok, yellow <= gpufair_warn, red above.
+				# Color the GPU request vs the node fair share: green within fair (CPU & mem);
+				# yellow only if CPU within fair AND mem within the nominal share; else red.
 				jobgpu = gpuraw
 				sub(/[^0-9]*$/, "", jobgpu); sub(/.*[^0-9]/, "", jobgpu)	# trailing count, if any
 				jobgpu = jobgpu + 0
@@ -561,9 +558,10 @@ BEGIN {
 					fcpu = noderatiocpu[NodeList]; fmem = noderatiomem[NodeList]; fnom = noderationommem[NodeList]
 					cfrac = (fcpu > 0 ? cpg/fcpu : 0)
 					mfrac = (fmem > 0 ? mpg/fmem : 0)
-					# CPU: exact fair share; yellow up to gpufair_warn x fair, red beyond
+					# CPU: must be fully within fair share for green/yellow; any CPU over
+					# the fair share -> red (no CPU tolerance band)
 					clvl = 0
-					if (fcpu > 0) { if (cfrac > gpufair_warn) clvl = 2; else if (cfrac > gpufair_ok) clvl = 1 }
+					if (fcpu > 0 && cfrac > gpufair_ok) clvl = 2
 					# Memory: green at/under true fair; yellow up to the nominal (rounded) fair
 					# share -- so a nominal-rounded request (e.g. 32GB where fair is 31.2GB) is
 					# borderline, not over; red only above the nominal share.
@@ -932,7 +930,7 @@ END {
 		printf("\n")
 		printf("GPU bar:  %s■%s in use   %s■%s free, fair share   %s■%s free, below fair   %s■%s free but blocked / node down\n", BLUE, NORMAL, GREEN, NORMAL, YELLOW, NORMAL, RED, NORMAL)
 		printf("Job GPU:  CPU- and memory-per-GPU vs the node fair share (total_cpu/total_gpu, total_mem/total_gpu):\n")
-		printf("          %sgreen%s within fair share   %syellow%s borderline (CPU <= %gx fair; mem up to the nominal/rounded share, e.g. 32GB vs 31.2GB)   %sred%s over\n", GREEN, NORMAL, YELLOW, NORMAL, gpufair_warn, RED, NORMAL)
+		printf("          %sgreen%s within fair share   %syellow%s borderline (CPU within fair AND mem only up to the nominal/rounded share, e.g. 32GB vs 31.2GB)   %sred%s over (CPU over fair, or mem over nominal)\n", GREEN, NORMAL, YELLOW, NORMAL, RED, NORMAL)
 		if (noversub > 0) {
 			printf("Oversubscribed jobs (the offending CPU/memory-per-GPU vs node fair share):\n")
 			for (oi = 1; oi <= noversub; oi++) printf("%s\n", oversub[oi])
