@@ -409,11 +409,19 @@ BEGIN {
 	maxgpus=ENVIRON["maxgpus"]+0	# Largest GPU count on any node (bar-column width)
 	gpubar_minmem=ENVIRON["gpubar_minmem"]+0	# Min MB for a free GPU to count as grabbable
 	if (gpubar_minmem <= 0) gpubar_minmem = 1024
-	# Per-job GPU fair-share coloring thresholds (multiples of the node fair ratio)
-	gpufair_ok=ENVIRON["gpufair_ok"]+0	# at/under this -> green
-	if (gpufair_ok <= 0) gpufair_ok = 1.05
-	gpufair_warn=ENVIRON["gpufair_warn"]+0	# above this -> red (between ok and warn -> yellow)
+	# Per-job GPU fair-share coloring. Green = at/under the true fair share (1.0x).
+	# CPU is exact, so it gets a small yellow band up to gpufair_warn x fair before red.
+	# Memory is rounded: RealMemory is below the nominal installed RAM (OS reserve), so
+	# users computing nominal/GPU (e.g. 256GB/8 = 32GB) land just over the true fair share
+	# (31.2GB). That nominal-rounded request is treated as borderline (yellow), not red;
+	# only memory above the nominal fair share is red. gpubar_nominal is the rounding
+	# granularity (MB) for inferring nominal RAM from RealMemory (default 16 GiB).
+	gpufair_ok=ENVIRON["gpufair_ok"]+0	# CPU/mem at/under this x fair -> green
+	if (gpufair_ok <= 0) gpufair_ok = 1.0
+	gpufair_warn=ENVIRON["gpufair_warn"]+0	# CPU above this x fair -> red (else yellow)
 	if (gpufair_warn <= 0) gpufair_warn = 1.25
+	gpunom_gran=ENVIRON["gpunom_gran"]+0	# round RealMemory up to this (MB) for nominal RAM
+	if (gpunom_gran <= 0) gpunom_gran = 16384
 	# Parse per-node "cores:mem:gpus" map for per-job fair-share coloring
 	split(ENVIRON["noderatiomap"], nrarr, "|")
 	for (nri in nrarr) {
@@ -423,6 +431,9 @@ BEGIN {
 			if (split(substr(nrarr[nri], neq+1), nrv, ":") == 3 && nrv[3] > 0) {
 				noderatiocpu[nrnode] = nrv[1] / nrv[3]
 				noderatiomem[nrnode] = nrv[2] / nrv[3]
+				# nominal RAM = RealMemory rounded up to gpunom_gran; fair share from that
+				nrnom = int((nrv[2] + gpunom_gran - 1) / gpunom_gran) * gpunom_gran
+				noderationommem[nrnode] = nrnom / nrv[3]
 			}
 		}
 	}
@@ -546,19 +557,26 @@ BEGIN {
 				nodejobgpu[NodeList] += jobgpu	# sum reservations per node (vs GresUsed)
 				gcol = GREEN
 				if (NodeList in noderatiocpu) {
-					cfrac = (noderatiocpu[NodeList] > 0 ? (jobcpu/jobgpu)/noderatiocpu[NodeList] : 0)
-					mfrac = (noderatiomem[NodeList] > 0 ? (jobmem/jobgpu)/noderatiomem[NodeList] : 0)
-					worst = (cfrac > mfrac ? cfrac : mfrac)
-					sevlvl = 0
-					if (worst > gpufair_warn) { gcol = RED; sevlvl = 2 }
-					else if (worst > gpufair_ok) { gcol = YELLOW; sevlvl = 1 }
-					if (sevlvl > 0) {
-						# Record the specific over-fair case for the legend at the bottom
+					cpg = jobcpu/jobgpu; mpg = jobmem/jobgpu
+					fcpu = noderatiocpu[NodeList]; fmem = noderatiomem[NodeList]; fnom = noderationommem[NodeList]
+					cfrac = (fcpu > 0 ? cpg/fcpu : 0)
+					mfrac = (fmem > 0 ? mpg/fmem : 0)
+					# CPU: exact fair share; yellow up to gpufair_warn x fair, red beyond
+					clvl = 0
+					if (fcpu > 0) { if (cfrac > gpufair_warn) clvl = 2; else if (cfrac > gpufair_ok) clvl = 1 }
+					# Memory: green at/under true fair; yellow up to the nominal (rounded) fair
+					# share -- so a nominal-rounded request (e.g. 32GB where fair is 31.2GB) is
+					# borderline, not over; red only above the nominal share.
+					mlvl = 0
+					if (fmem > 0) { if (mpg > fnom) mlvl = 2; else if (mfrac > gpufair_ok) mlvl = 1 }
+					sevlvl = (clvl > mlvl ? clvl : mlvl)
+					gcol = (sevlvl == 2 ? RED : (sevlvl == 1 ? YELLOW : GREEN))
+					# List only genuine oversubscription (red) at the bottom; yellow is tolerated
+					if (sevlvl == 2) {
 						reason = ""
-						if (cfrac > gpufair_ok) reason = reason sprintf("CPU %.2fx ", cfrac)
-						if (mfrac > gpufair_ok) reason = reason sprintf("mem %.2fx ", mfrac)
-						sev = (sevlvl == 2 ? RED "over" NORMAL : YELLOW "borderline" NORMAL)
-						oversub[++noversub] = sprintf("  %-12s %-9s %-12s %-22s %s", NodeList, User, JobArrayID, reason, sev)
+						if (clvl == 2) reason = reason sprintf("CPU %.2fx ", cfrac)
+						if (mlvl == 2) reason = reason sprintf("mem %.2fx ", mfrac)
+						oversub[++noversub] = sprintf("  %-12s %-9s %-12s %-22s %sover%s", NodeList, User, JobArrayID, reason, RED, NORMAL)
 					}
 				}
 				GRES = gcol gpuraw NORMAL
@@ -913,8 +931,8 @@ END {
 	if (printgres == 1) {
 		printf("\n")
 		printf("GPU bar:  %s■%s in use   %s■%s free, fair share   %s■%s free, below fair   %s■%s free but blocked / node down\n", BLUE, NORMAL, GREEN, NORMAL, YELLOW, NORMAL, RED, NORMAL)
-		printf("Job GPU:  colored by its CPU- and memory-per-GPU vs the node fair share (total_cpu/total_gpu and total_mem/total_gpu):\n")
-		printf("          %sgreen%s <= %gx fair      %syellow%s <= %gx (borderline)      %sred%s > %gx (oversubscribed)\n", GREEN, NORMAL, gpufair_ok, YELLOW, NORMAL, gpufair_warn, RED, NORMAL, gpufair_warn)
+		printf("Job GPU:  CPU- and memory-per-GPU vs the node fair share (total_cpu/total_gpu, total_mem/total_gpu):\n")
+		printf("          %sgreen%s within fair share   %syellow%s borderline (CPU <= %gx fair; mem up to the nominal/rounded share, e.g. 32GB vs 31.2GB)   %sred%s over\n", GREEN, NORMAL, YELLOW, NORMAL, gpufair_warn, RED, NORMAL)
 		if (noversub > 0) {
 			printf("Oversubscribed jobs (the offending CPU/memory-per-GPU vs node fair share):\n")
 			for (oi = 1; oi <= noversub; oi++) printf("%s\n", oversub[oi])
