@@ -383,6 +383,15 @@ function gpucount(s,   n) {
 	return (n == 0 ? 1 : n)		# a bare "gres:gpu" means 1
 }
 
+# GPU type in a gres string (e.g. gpu:Ampere:8 -> Ampere, gres:gpu:Ada -> Ada);
+# "" when no type is given (e.g. gres:gpu:1 or a bare gres:gpu).
+function gputype(s,   a, n, i, t) {
+	n = split(s, a, ":")
+	for (i = 1; i < n; i++)
+		if (a[i] == "gpu") { t = a[i+1]; return (t ~ /^[0-9]/) ? "" : t }
+	return ""
+}
+
 BEGIN {
 	#####################################################################################
 	# Initialization
@@ -646,10 +655,16 @@ BEGIN {
 	if (printgres == 1) {
 		PENDLIST = prefix "/squeue -t PENDING -h -O \047tres-per-node: ,tres-per-job: ,tres-per-task: ,tres-per-socket: ,Reason:\047 " selection " " ENVIRON["partition"]
 		while ((PENDLIST | getline) > 0) {
-			pg = gpucount($1); if (pg == 0) pg = gpucount($2); if (pg == 0) pg = gpucount($3); if (pg == 0) pg = gpucount($4)
+			pg = gpucount($1); pf = $1
+			if (pg == 0) { pg = gpucount($2); pf = $2 }
+			if (pg == 0) { pg = gpucount($3); pf = $3 }
+			if (pg == 0) { pg = gpucount($4); pf = $4 }
 			if (pg == 0) continue		# not a GPU job -> not GPU demand
 			prsn = $5
-			if (prsn ~ /^(Resources|Priority|ReqNodeNotAvail|Nodes_required)/) { pwaitj++; pwaitg += pg }
+			if (prsn ~ /^(Resources|Priority|ReqNodeNotAvail|Nodes_required)/) {
+				pwaitj++; pwaitg += pg
+				pt = gputype(pf); pwaitbytype[pt == "" ? "any" : pt] += pg
+			}
 			else if (prsn ~ /Held/)              pheld++
 			else if (prsn ~ /JobArrayTaskLimit/) parray++
 			else if (prsn ~ /Dependency/)        pdep++
@@ -802,6 +817,8 @@ BEGIN {
 			qtotgpu += availgpus
 			qfreegpu += (availgpus - usedgpus)
 			if (usedgpus > jobgpus) qleaked += (usedgpus - jobgpus)
+			nodetype = gputype(nodegres); if (nodetype == "") nodetype = "any"
+			qfreebytype[nodetype] += (availgpus - usedgpus)
 		}
 		# Pad to the widest node bar (maxgpus + 2 brackets) plus a separator space
 		pad = (maxgpus + 2) - barvis + 1
@@ -940,6 +957,21 @@ END {
 			printf("GRES mismatch (* in count; Slurm GresUsed vs summed job reservations):\n")
 			for (mi = 1; mi <= ngresmm; mi++) printf("%s\n", gresmm[mi])
 		}
+		# Per-GPU-type breakdown of demand and free supply (union of types, sorted).
+		# A demanded type with zero free GPUs is the bottleneck -> shown in red; free
+		# counts are green when >0, red when 0. This explains "jobs wait though GPUs
+		# are free": the free ones are the wrong type.
+		for (t in qfreebytype) alltypes[t] = 1
+		for (t in pwaitbytype) alltypes[t] = 1
+		ntypes = asorti(alltypes, sortedtypes)
+		dem_by = ""; sup_by = ""
+		for (ti = 1; ti <= ntypes; ti++) {
+			t = sortedtypes[ti]; fc = qfreebytype[t] + 0
+			if (pwaitbytype[t] > 0)
+				dem_by = dem_by (dem_by == "" ? "" : ", ") (fc == 0 ? RED : NORMAL) t " " pwaitbytype[t] NORMAL
+			if (t in qfreebytype)
+				sup_by = sup_by (sup_by == "" ? "" : ", ") t " " (fc > 0 ? GREEN : RED) fc NORMAL
+		}
 		# Queue (GPU demand) and supply summary
 		qnot = ""
 		if (pheld)  qnot = qnot sprintf("  %d held", pheld)
@@ -947,10 +979,12 @@ END {
 		if (pdep)   qnot = qnot sprintf("  %d dependency", pdep)
 		if (pbegin) qnot = qnot sprintf("  %d begin-delayed", pbegin)
 		if (pother) qnot = qnot sprintf("  %d other", pother)
-		printf("Queue:    waiting for a GPU: %s%d jobs / %d GPUs%s%s\n", \
+		printf("Queue:    waiting for a GPU: %s%d jobs / %d GPUs%s%s%s\n", \
 			(pwaitg > 0 ? YELLOW : NORMAL), pwaitj+0, pwaitg+0, NORMAL, \
+			(dem_by != "" ? "  [" dem_by "]" : ""), \
 			(qnot != "" ? "    not competing:" qnot : ""))
 		supnote = (qleaked > 0 ? sprintf("  (>=%d more idle but marked used -- GresUsed leak, see above)", qleaked) : "")
-		printf("Supply:   %d / %d GPUs free per Slurm%s\n", qfreegpu+0, qtotgpu+0, supnote)
+		printf("Supply:   %d / %d GPUs free per Slurm%s%s\n", qfreegpu+0, qtotgpu+0, \
+			(sup_by != "" ? "  [" sup_by "]" : ""), supnote)
 	}
 }'
