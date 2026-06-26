@@ -759,13 +759,15 @@ BEGIN {
 	}
 
 	# Build the colored per-GPU availability bar (the [....] schema), one mark per GPU:
-	#   blue   = in use
+	#   blue   = in use (reserved by a running job)
+	#   purple = marked used by Slurm but reserved by no job (leaked -- not really in use)
 	#   green  = free and usable at the node fair CPU/mem-per-GPU ratio
 	#   yellow = free but only below the fair ratio (CPU/mem cramped)
 	#   red    = free but blocked (CPU/memory exhausted, or node down/drained/reserved)
 	# Padded to the widest node so the following columns stay aligned.
 	gpubar = ""
 	if (printgres == 1) {
+		jobgpus = (node in nodejobgpu ? nodejobgpu[node] : 0)	# GPUs actually reserved by jobs
 		barvis = 0
 		if (availgpus > 0) {
 			free_gpus = availgpus - usedgpus
@@ -795,17 +797,20 @@ BEGIN {
 				ylw = grab - grn	# free but below fair share
 				rd = free_gpus - grab	# free but blocked (no CPU/mem to pair)
 			}
+			# Split the "used" marks: reserved by a job (blue) vs leaked/unreserved (purple)
+			bluen = (jobgpus < usedgpus ? jobgpus : usedgpus)
+			leakn = usedgpus - bluen
 			gpubar = "["
-			for (gbi=0; gbi<usedgpus; gbi++) gpubar = gpubar BLUE   "■" NORMAL
-			for (gbi=0; gbi<grn; gbi++)      gpubar = gpubar GREEN  "■" NORMAL
-			for (gbi=0; gbi<ylw; gbi++)      gpubar = gpubar YELLOW "■" NORMAL
-			for (gbi=0; gbi<rd; gbi++)       gpubar = gpubar RED    "■" NORMAL
+			for (gbi=0; gbi<bluen; gbi++) gpubar = gpubar BLUE    "■" NORMAL
+			for (gbi=0; gbi<leakn; gbi++) gpubar = gpubar MAGENTA "■" NORMAL
+			for (gbi=0; gbi<grn; gbi++)   gpubar = gpubar GREEN   "■" NORMAL
+			for (gbi=0; gbi<ylw; gbi++)   gpubar = gpubar YELLOW  "■" NORMAL
+			for (gbi=0; gbi<rd; gbi++)    gpubar = gpubar RED     "■" NORMAL
 			gpubar = gpubar "]"
 			barvis = availgpus + 2
 		}
 		# Flag GRES accounting mismatch: node GresUsed vs summed job GPU reservations.
 		# A leak (GresUsed > reserved) strands GPUs; the reverse means usage GresUsed misses.
-		jobgpus = (node in nodejobgpu ? nodejobgpu[node] : 0)
 		gmismatch = (availgpus > 0 && jobgpus != usedgpus)
 		if (gmismatch) {
 			gmd = usedgpus - jobgpus; gmad = (gmd < 0 ? -gmd : gmd)
@@ -945,7 +950,7 @@ END {
 	# Legend explaining the -G GPU bar colors and what counts as oversubscription
 	if (printgres == 1) {
 		printf("\n")
-		printf("GPU bar:  %s■%s in use   %s■%s free, fair share   %s■%s free, below fair   %s■%s free but blocked / node down\n", BLUE, NORMAL, GREEN, NORMAL, YELLOW, NORMAL, RED, NORMAL)
+		printf("GPU bar:  %s■%s in use   %s■%s leaked (marked used, no job)   %s■%s free, fair share   %s■%s free, below fair   %s■%s free but blocked / down\n", BLUE, NORMAL, MAGENTA, NORMAL, GREEN, NORMAL, YELLOW, NORMAL, RED, NORMAL)
 		printf("Job GPU:  CPU- and memory-per-GPU vs the node fair share (total_cpu/total_gpu, total_mem/total_gpu):\n")
 		printf("          %sgreen%s within fair share   %syellow%s borderline (CPU within fair AND mem only up to the nominal/rounded share, e.g. 32GB vs 31.2GB)   %sred%s over (CPU over fair, or mem over nominal)\n", GREEN, NORMAL, YELLOW, NORMAL, RED, NORMAL)
 		if (noversub > 0) {
